@@ -1,0 +1,9 @@
+smartapi-python==1.5.5
+pyotp
+pandas==2.3.0
+numpy==1.26.4
+requests
+ta==0.11.0
+streamlit
+plotly
+logzero
