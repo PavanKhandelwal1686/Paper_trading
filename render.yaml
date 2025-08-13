@@ -1,0 +1,32 @@
+services:
+  - type: worker
+    name: nifty-trading-bot
+    env: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: python Paper_trading.py
+    plan: free
+    envVars:
+      - key: ANGEL_CLIENT_ID
+        sync: false
+      - key: ANGEL_CLIENT_PW
+        sync: false
+      - key: ANGEL_TOTP_SECRET
+        sync: false
+      - key: EMAIL_USER
+        sync: false
+      - key: EMAIL_PASS
+        sync: false
+
+  - type: web
+    name: nifty-dashboard
+    env: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: streamlit run dashboard_app.py --server.port $PORT --server.address 0.0.0.0
+    plan: free
+    envVars:
+      - key: ANGEL_CLIENT_ID
+        sync: false
+      - key: ANGEL_CLIENT_PW
+        sync: false
+      - key: ANGEL_TOTP_SECRET
+        sync: false
