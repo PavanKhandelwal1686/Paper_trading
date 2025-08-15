@@ -1,0 +1,453 @@
+# bot.py
+import os, time, json, math, random, warnings
+from datetime import datetime, timedelta, time as dtime
+import pandas as pd
+import numpy as np
+import requests
+
+warnings.filterwarnings("ignore")
+
+# ========= Optional: SmartAPI (only used if PAPER_MODE=False) =========
+try:
+    from SmartApi.smartConnect import SmartConnect
+except Exception:
+    SmartConnect = None
+
+# ========= Technical Indicators =========
+# pip install ta
+from ta.volatility import AverageTrueRange
+from ta.trend import MACD, ADXIndicator
+from ta.momentum import RSIIndicator
+# --------------------------
+# CONFIG
+# --------------------------
+PAPER_MODE = True  # <- keep True until you want live orders
+
+# Angel One / SmartAPI creds (only needed when PAPER_MODE = False)
+API_KEY     = os.getenv("2SoLXncg")
+CLIENT_ID   = os.getenv("P486901")
+PASSWORD    = os.getenv("1686")
+TOTP_SECRET = os.getenv("NATIIWUTIZC5KFPERWLQ3MKBI4")
+
+# Symbols/Tokens
+NIFTY_SYMBOL_TOKEN = "99926000"  # NIFTY 50 Spot (NSE)
+EXCHANGE_SPOT = "NSE"
+EXCHANGE_OPT  = "NFO"
+
+# Data paths
+DATA_DIR = os.path.join("data")
+os.makedirs(DATA_DIR, exist_ok=True)
+CANDLES_CSV   = os.path.join(DATA_DIR, "nifty_spot_3min.csv")
+POSITIONS_CSV = os.path.join(DATA_DIR, "positions.csv")
+BACKTEST_CSV  = os.path.join(DATA_DIR, "backtest_equity.csv")
+
+# Order config (live mode)
+PRODUCTTYPE = "INTRADAY"
+ORDERTYPE   = "MARKET"
+DURATION    = "DAY"
+QTY         = 50   # 1 lot for NIFTY options (adjust)
+
+# Risk Controls
+RISK_MODE       = "fixed"        # "fixed" or "atr"
+FIXED_SL_PCT    = 0.25           # 25% stoploss on option premium
+FIXED_TP_PCT    = 0.40           # 40% target on option premium
+ATR_MULT_SL     = 0.8            # when RISK_MODE="atr"
+ATR_MULT_TP     = 1.2
+ATR_TO_OPT_FCTR = 2.0            # rough spot ATR -> option pts
+MAX_BARS_HOLD   = 8              # e.g. 8 x 3min = 24 minutes
+SQUARE_OFF_TIME = dtime(15, 25)  # square off
+
+# Trading Hours (IST) for live PCR/OC (NSE)
+MARKET_OPEN  = dtime(9, 15)
+MARKET_CLOSE = dtime(15, 30)
+
+# Signal thresholds
+RSI_BUY_TH    = 30
+RSI_SELL_TH   = 70
+ADX_MIN       = 20
+
+# -------------- Utilities --------------
+def is_market_open_now():
+    now = datetime.now().time()
+    return (now >= MARKET_OPEN) and (now <= MARKET_CLOSE)
+
+def now_str():
+    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+def read_json(path):
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+# ------- SmartAPI Login (optional) ------
+smart = None
+def login_if_needed():
+    global smart
+    if PAPER_MODE:
+        return None
+    if SmartConnect is None:
+        raise RuntimeError("SmartConnect not installed, but PAPER_MODE=False.")
+    import pyotp
+    smart = SmartConnect(api_key=API_KEY)
+    totp = pyotp.TOTP(TOTP_SECRET).now()
+    session = smart.generateSession(CLIENT_ID, PASSWORD, totp)
+    return session
+
+# ------- Candles fetch (3-min) ----------
+def fetch_spot_3min():
+    """
+    Fetch last ~5 trading days 3-min NIFTY spot candles via SmartAPI (if live),
+    else just append a synthetic bar to keep flow running in PAPER_MODE.
+    """
+    end = datetime.now()
+    start = end - timedelta(days=7)
+    if PAPER_MODE or smart is None:
+        # PAPER: make a synthetic single bar that "moves"
+        df_old = pd.read_csv(CANDLES_CSV, parse_dates=["timestamp"]) if os.path.exists(CANDLES_CSV) else None
+        last_close = 24000 if df_old is None or df_old.empty else float(df_old["close"].iloc[-1])
+        new_close = last_close * (1 + random.uniform(-0.0015, 0.0015))
+        new_open  = last_close
+        high = max(new_open, new_close) * (1+random.uniform(0,0.0007))
+        low  = min(new_open, new_close) * (1-random.uniform(0,0.0007))
+        vol  = random.randint(150000, 350000)
+        ts = datetime.now().replace(second=0, microsecond=0)
+        row = pd.DataFrame([{
+            "timestamp": ts,
+            "open": round(new_open,2),
+            "high": round(high,2),
+            "low":  round(low,2),
+            "close":round(new_close,2),
+            "volume":vol
+        }])
+        if df_old is not None and not df_old.empty:
+            out = pd.concat([df_old, row], ignore_index=True)
+            out = out.drop_duplicates(subset="timestamp")
+        else:
+            out = row
+        out.to_csv(CANDLES_CSV, index=False)
+        return out
+    else:
+        params = {
+            "exchange": EXCHANGE_SPOT,
+            "symboltoken": NIFTY_SYMBOL_TOKEN,
+            "interval": "THREE_MINUTE",
+            "fromdate": start.strftime('%Y-%m-%d %H:%M'),
+            "todate": end.strftime('%Y-%m-%d %H:%M')
+        }
+        res = smart.getCandleData(params)
+        data = res.get("data", [])
+        if not data:
+            return pd.DataFrame(columns=["timestamp","open","high","low","close","volume"])
+        df = pd.DataFrame(data, columns=["timestamp","open","high","low","close","volume"])
+        df["timestamp"] = pd.to_datetime(df["timestamp"]).dt.tz_localize(None)
+        df[["open","high","low","close","volume"]] = df[["open","high","low","close","volume"]].astype(float)
+        # append to CSV
+        if os.path.exists(CANDLES_CSV):
+            old = pd.read_csv(CANDLES_CSV, parse_dates=["timestamp"])
+            df = pd.concat([old, df]).drop_duplicates(subset="timestamp").reset_index(drop=True)
+        df.to_csv(CANDLES_CSV, index=False)
+        return df
+
+# ----------- Indicators -----------------
+def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty:
+        return df
+    df = df.sort_values("timestamp").reset_index(drop=True)
+    df["RSI"] = RSIIndicator(close=df["close"], window=14).rsi()
+    macd = MACD(close=df["close"])
+    df["MACD"] = macd.macd()
+    df["Signal"] = macd.macd_signal()
+    df["ATR"] = AverageTrueRange(df["high"], df["low"], df["close"], window=14).average_true_range()
+    adx = ADXIndicator(df["high"], df["low"], df["close"], window=14)
+    df["ADX"] = adx.adx()
+    return df
+
+# -------- PCR from NSE (best-effort) ----
+def get_live_pcr_from_nse(max_retries=3, timeout=10):
+    """
+    Works only during market hours (NSE blocks often without headers/cookies).
+    Returns float PCR or 1.0 on failure.
+    """
+    if not is_market_open_now():
+        print("⏰ Market closed. Skipping NSE PCR fetch.")
+        return 1.0
+    url = "https://www.nseindia.com/api/option-chain-indices?symbol=NIFTY"
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                      "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36 Edg/124.0.0.0",
+        "Accept": "application/json, text/plain, */*",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Referer": "https://www.nseindia.com/option-chain",
+        "Connection": "keep-alive",
+        "Origin": "https://www.nseindia.com"
+    }
+    s = requests.Session()
+    try:
+        s.get("https://www.nseindia.com", headers=headers, timeout=timeout)
+        time.sleep(1.2)
+    except Exception:
+        pass
+
+    for attempt in range(1, max_retries+1):
+        try:
+            r = s.get(url, headers=headers, timeout=timeout)
+            if r.status_code != 200 or not r.content:
+                raise ValueError("Empty or invalid response")
+            data = r.json()
+            records = data.get("records", {}).get("data", [])
+            ce_oi = sum(rec.get("CE", {}).get("openInterest", 0) for rec in records if "CE" in rec)
+            pe_oi = sum(rec.get("PE", {}).get("openInterest", 0) for rec in records if "PE" in rec)
+            return round(pe_oi/ce_oi, 2) if ce_oi else 1.0
+        except Exception as e:
+            print(f"⚠️ NSE PCR attempt {attempt} failed: {e}")
+            time.sleep(1 + attempt * 0.5)
+    print("⚠️ All PCR attempts failed. Defaulting to 1.0")
+    return 1.0
+
+# ---------- Positions store -------------
+def load_positions():
+    if os.path.exists(POSITIONS_CSV):
+        return pd.read_csv(POSITIONS_CSV, parse_dates=["entry_time","exit_time"], keep_default_na=False)
+    return pd.DataFrame(columns=[
+        "id","status","entry_time","exit_time","side","symbol","token","qty",
+        "entry_price","exit_price","sl","tp","pnl","bars_held","reason_exit","expiry","atm"
+    ])
+
+def save_positions(df):
+    df.to_csv(POSITIONS_CSV, index=False)
+
+def have_open_position(df_pos):
+    return (df_pos["status"] == "OPEN").any()
+
+def fetch_option_ltp(token: str):
+    """In PAPER mode we fake LTP; in LIVE we query SmartAPI LTP."""
+    if token in (None, "", "NA"):
+        return None
+    if PAPER_MODE or smart is None:
+        return float(random.randrange(80, 240))  # synthetic
+    try:
+        q = smart.ltpData(exchange=EXCHANGE_OPT, tradingsymbol="", symboltoken=str(token))
+        return float(q["data"]["ltp"])
+    except Exception as e:
+        print(f"LTP fetch failed for token={token}: {e}")
+        return None
+
+def compute_sl_tp(entry_price, spot_atr=None):
+    if RISK_MODE == "fixed" or (spot_atr is None):
+        sl = round(entry_price * (1 - FIXED_SL_PCT), 2)
+        tp = round(entry_price * (1 + FIXED_TP_PCT), 2)
+        return sl, tp
+    opt_atr_pts = max(0.5, float(spot_atr) * ATR_TO_OPT_FCTR)
+    sl = round(entry_price - ATR_MULT_SL * opt_atr_pts, 2)
+    tp = round(entry_price + ATR_MULT_TP * opt_atr_pts, 2)
+    return max(0.05, sl), max(0.10, tp)
+
+def open_position(side, symbol, token, qty, entry_price, expiry, atm, spot_atr=None):
+    df_pos = load_positions()
+    sl, tp = compute_sl_tp(entry_price, spot_atr)
+    rid = f"P{int(time.time())}"
+    new = {
+        "id": rid, "status": "OPEN", "entry_time": datetime.now(),
+        "exit_time": pd.NaT, "side": side, "symbol": symbol, "token": token, "qty": int(qty),
+        "entry_price": float(entry_price), "exit_price": np.nan, "sl": sl, "tp": tp,
+        "pnl": np.nan, "bars_held": 0, "reason_exit": "", "expiry": str(expiry), "atm": int(atm)
+    }
+    df_pos = pd.concat([df_pos, pd.DataFrame([new])], ignore_index=True)
+    save_positions(df_pos)
+    print(f"[{now_str()}] OPEN {side} {symbol} token={token} qty={qty} entry={entry_price} SL={sl} TP={tp}")
+    return rid
+
+def close_position(row, reason, ltp=None):
+    df_pos = load_positions()
+    idxs = df_pos.index[df_pos["id"] == row["id"]]
+    if len(idxs) == 0:
+        return
+    i = idxs[0]
+
+    if ltp is None:
+        ltp = fetch_option_ltp(row["token"]) or row["entry_price"]
+
+    # live broker SELL to close only if BUY entries; here we assume BUY-only system
+    if not PAPER_MODE and smart is not None and df_pos.loc[i, "status"] == "OPEN":
+        try:
+            params = {
+                "variety": "NORMAL",
+                "symboltoken": str(row["token"]),
+                "transactiontype": "SELL",
+                "exchange": EXCHANGE_OPT,
+                "ordertype": ORDERTYPE,
+                "producttype": PRODUCTTYPE,
+                "duration": DURATION,
+                "price": "0",
+                "squareoff": "0",
+                "stoploss": "0",
+                "quantity": str(int(row["qty"]))
+            }
+            smart.placeOrder(params)
+        except Exception as e:
+            print(f"Exit order failed {row['id']}: {e}")
+
+    df_pos.loc[i, "status"] = "CLOSED"
+    df_pos.loc[i, "exit_time"] = datetime.now()
+    df_pos.loc[i, "exit_price"] = round(float(ltp), 2)
+    df_pos.loc[i, "pnl"] = round((df_pos.loc[i, "exit_price"] - df_pos.loc[i, "entry_price"]) * float(row["qty"]), 2)
+    df_pos.loc[i, "reason_exit"] = reason
+    save_positions(df_pos)
+    print(f"[{now_str()}] CLOSE {row['id']} {reason} exit={ltp} pnl={df_pos.loc[i,'pnl']}")
+
+def evaluate_open_positions():
+    df_pos = load_positions()
+    if df_pos.empty:
+        return
+    for _, row in df_pos[df_pos["status"] == "OPEN"].iterrows():
+        ltp = fetch_option_ltp(row["token"])
+        if ltp is None:
+            continue
+
+        # SL/TP
+        if float(ltp) <= float(row["sl"]):
+            close_position(row, "SL_HIT", ltp)
+            continue
+        if float(ltp) >= float(row["tp"]):
+            close_position(row, "TP_HIT", ltp)
+            continue
+
+        # increment bars_held
+        df_pos2 = load_positions()
+        i = df_pos2.index[df_pos2["id"] == row["id"]][0]
+        df_pos2.loc[i, "bars_held"] = int(df_pos2.loc[i, "bars_held"]) + 1
+        save_positions(df_pos2)
+
+        if int(df_pos2.loc[i, "bars_held"]) >= MAX_BARS_HOLD:
+            close_position(row, "MAX_BARS_EXIT", ltp)
+            continue
+
+        if datetime.now().time() >= SQUARE_OFF_TIME:
+            close_position(row, "SQUARE_OFF", ltp)
+            continue
+
+# ------- Simple Signal Logic ------------
+def generate_signal_row(df_last_row, pcr_value):
+    """
+    Returns side in {"BUY_CALL","BUY_PUT", None} based on RSI/MACD/ADX/PCR
+    """
+    rsi = df_last_row["RSI"]
+    macd = df_last_row["MACD"]
+    sig  = df_last_row["Signal"]
+    adx  = df_last_row["ADX"]
+
+    side = None
+    # Example: if RSI < 30 and MACD>Signal and ADX>20 -> BUY CALL
+    if (rsi < RSI_BUY_TH) and (macd > sig) and (adx > ADX_MIN) and (pcr_value <= 1.0):
+        side = "BUY_CALL"
+    # Example: if RSI > 70 and MACD<Signal and ADX>20 -> BUY PUT
+    elif (rsi > RSI_SELL_TH) and (macd < sig) and (adx > ADX_MIN) and (pcr_value >= 1.0):
+        side = "BUY_PUT"
+    return side
+
+# ---- Option selection (ATM strike) -----
+def pick_option_symbol(atm_spot: float, side: str, expiry: str):
+    """
+    Returns simple (symbol_str, token_str) tuple.
+    In PAPER mode we fabricate a symbol & token; in LIVE, you should map using OpenAPIScripMaster.json.
+    """
+    atm = int(round(atm_spot / 50.0) * 50)
+    if side == "BUY_CALL":
+        sym = f"NIFTY {expiry} {atm} CE"
+    elif side == "BUY_PUT":
+        sym = f"NIFTY {expiry} {atm} PE"
+    else:
+        return None, None, atm
+
+    if PAPER_MODE:
+        # Fabricated token
+        token = str(500000 + atm + (0 if "CE" in sym else 1))
+        return sym, token, atm
+    else:
+        # TODO: Map from OpenAPIScripMaster.json to real token
+        # For now return placeholder (must implement for live trading).
+        return sym, None, atm
+
+# --------- Backtest equity (from CSV) ---
+def backtest_from_positions(initial_capital=100000):
+    dfp = load_positions()
+    if dfp.empty:
+        return
+    dfp = dfp[dfp["status"] == "CLOSED"].copy().sort_values("exit_time")
+    if dfp.empty:
+        return
+    dfp["pnl_cum"] = dfp["pnl"].cumsum()
+    dfp["equity"]  = initial_capital + dfp["pnl_cum"]
+    # Build a timeline (use exit_time for equity steps)
+    out = dfp[["exit_time","equity"]].rename(columns={"exit_time":"timestamp"})
+    out.to_csv(BACKTEST_CSV, index=False)
+
+# -------------- Main tick ---------------
+def run_once():
+    # Login if needed
+    if not PAPER_MODE and smart is None:
+        login_if_needed()
+
+    # 1) Fetch/append latest candles
+    df = fetch_spot_3min()
+    if df.empty:
+        print("❌ No candles.")
+        return
+
+    # 2) Indicators
+    df = add_indicators(df)
+    df.to_csv(CANDLES_CSV, index=False)
+
+    # 3) PCR best-effort
+    pcr = get_live_pcr_from_nse() if is_market_open_now() else 1.0
+
+    # 4) Signal on last row
+    last = df.iloc[-1]
+    side = generate_signal_row(last, pcr)
+
+    # 5) If no open position and have side, open
+    df_pos = load_positions()
+    if (not have_open_position(df_pos)) and side is not None:
+        expiry = pick_nearest_expiry()
+        sym, token, atm = pick_option_symbol(atm_spot=last["close"], side=side, expiry=expiry)
+        if sym is not None:
+            entry_ltp = fetch_option_ltp(token) or 120.0
+            spot_atr = float(last.get("ATR", np.nan)) if not np.isnan(last.get("ATR", np.nan)) else None
+            open_position(side, sym, token, QTY, entry_ltp, expiry, atm, spot_atr=spot_atr)
+
+    # 6) Evaluate exits for any open positions
+    evaluate_open_positions()
+
+    # 7) Update backtest-equity from closed trades
+    backtest_from_positions()
+
+def pick_nearest_expiry():
+    """Returns a simple weekly expiry string like '03JUL2025' (approx)."""
+    # Very lightweight approx: nearest Thursday from today
+    d = datetime.now().date()
+    # next Thursday
+    days_ahead = (3 - d.weekday()) % 7  # Thu=3
+    if days_ahead == 0:
+        days_ahead = 7
+    expiry_date = d + timedelta(days=days_ahead)
+    return expiry_date.strftime("%d%b%Y").upper()
+
+# -------------- CLI ---------------------
+if __name__ == "__main__":
+    # run one pass every 3 minutes
+    LOOP = True
+    INTERVAL_SEC = 180
+    print(f"🚀 Starting bot (PAPER_MODE={PAPER_MODE})  — Ctrl+C to stop")
+    while True:
+        try:
+            run_once()
+        except KeyboardInterrupt:
+            print("Stopping...")
+            break
+        except Exception as e:
+            print(f"Error in run_once: {e}")
+        if not LOOP:
+            break
+        time.sleep(INTERVAL_SEC)
